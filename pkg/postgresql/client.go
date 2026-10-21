@@ -35,6 +35,17 @@ var promSamples = list.New()
 
 // QueueMutex is used thread safe operations on promSamples list object.
 var QueueMutex sync.Mutex
+
+// vMetricMaxID is the highest metric_id known to this process (loaded from
+// metric_labels at start, then advanced for every new series). New series get
+// vMetricMaxID+1: ids in the table are not dense, so len(map)+1 collided with
+// existing ids after a restart and wrote samples under another series' id.
+var vMetricMaxID int64
+
+// maxBufferedRows bounds what is kept in memory while the database is
+// unreachable; beyond it the oldest batch is dropped and logged.
+const maxBufferedRows = 1000000
+
 var vMetricIDMapMutex sync.Mutex
 var vMetricIDMap tMetricIDMap
 
@@ -48,8 +59,9 @@ type PGWriter struct {
 	valueRows [][]interface{}
 	labelRows [][]interface{}
 
-	PGWriterMutex sync.Mutex
-	logger        log.Logger
+	PGWriterMutex   sync.Mutex
+	partitionScheme string
+	logger          log.Logger
 }
 
 // PGParser - Threaded parser
@@ -60,6 +72,29 @@ type PGParser struct {
 
 	lastPartitionTS time.Time
 	valueRows       [][]interface{}
+}
+
+// partitionsReady remembers the days whose partitions exist (per process).
+var partitionsReady = map[string]bool{}
+
+// ensurePartitions creates the partitions for every day present in rows
+// before they are copied, so a sample never meets a missing partition.
+func (c *PGWriter) ensurePartitions(rows [][]interface{}) error {
+	for _, r := range rows {
+		t, ok := r[1].(time.Time)
+		if !ok {
+			continue
+		}
+		day := t.UTC().Format("20060102")
+		if partitionsReady[day] {
+			continue
+		}
+		if err := c.setupPgPartitions(c.partitionScheme, t.UTC()); err != nil {
+			return err
+		}
+		partitionsReady[day] = true
+	}
+	return nil
 }
 
 // RunPGParser starts the client and listens for a shutdown call.
@@ -78,17 +113,13 @@ func (p *PGParser) RunPGParser(tid int, partitionScheme string, c *PGWriter) {
 				sMetric := metricString(sample.Metric)
 				ts := time.Unix(sample.Timestamp.Unix(), 0)
 				milliseconds := sample.Timestamp.UnixNano() / 1000000
-				if ts.Year() != p.lastPartitionTS.Year() ||
-					ts.Month() != p.lastPartitionTS.Month() ||
-					ts.Day() != p.lastPartitionTS.Day() {
-					p.lastPartitionTS = ts
-					_ = c.setupPgPartitions(partitionScheme, p.lastPartitionTS)
-				}
+				_ = ts // partitions are created by the writer (ensurePartitions), which owns the connection
 				vMetricIDMapMutex.Lock()
 				id, ok := vMetricIDMap[sMetric]
 
 				if !ok {
-					var nextId int64 = int64(len(vMetricIDMap) + 1)
+					vMetricMaxID++
+					var nextId int64 = vMetricMaxID
 					vMetricIDMap[sMetric] = nextId
 					i := strings.Index(sMetric, "{")
 					jsonbMap := make(map[string]interface{})
@@ -120,6 +151,7 @@ func (p *PGParser) PGParserShutdown() {
 func (c *PGWriter) RunPGWriter(l log.Logger, tid int, commitSecs int, commitRows int, Parsers int, partitionScheme string) {
 	c.logger = l
 	c.id = tid
+	c.partitionScheme = partitionScheme
 	period := commitSecs * 1000
 	var err error
 	var parser [20]PGParser
@@ -142,7 +174,8 @@ func (c *PGWriter) RunPGWriter(l log.Logger, tid int, commitSecs int, commitRows
 	c.KeepRunning = true
 	// Loop that runs forever
 	for c.KeepRunning {
-		if (period <= 0 && len(c.valueRows) > 0) || (len(c.valueRows) > commitRows) {
+		values, labels := c.pending()
+		if (period <= 0 && (values > 0 || labels > 0)) || (values > commitRows) {
 			c.PGWriterSave()
 			period = commitSecs * 1000
 		} else {
@@ -160,35 +193,109 @@ func (c *PGWriter) PGWriterShutdown() {
 	c.KeepRunning = false
 }
 
-// PGWriterSave save data to DB
+// PGWriterSave save data to DB. The batch is taken under the parsers' mutex;
+// on a broken connection the writer reconnects (DATABASE_URL may list several
+// hosts with target_session_attrs=read-write, so it follows a promoted
+// primary) and retries the same rows. A batch that still fails is put back
+// and retried at the next commit instead of being dropped.
 func (c *PGWriter) PGWriterSave() {
-	var copyCount, lblCount, rowCount int64
-	var err error
 	begin := time.Now()
-	lblCount = int64(len(c.labelRows))
 	c.PGWriterMutex.Lock()
-	if lblCount > 0 {
-		copyCount, err := c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_labels"}, []string{"metric_id", "metric_name", "metric_name_label", "metric_labels"}, pgx.CopyFromRows(c.labelRows))
-		c.labelRows = nil
+	defer c.PGWriterMutex.Unlock()
+	vMetricIDMapMutex.Lock()
+	labelRows, valueRows := c.labelRows, c.valueRows
+	c.labelRows, c.valueRows = nil, nil
+	vMetricIDMapMutex.Unlock()
+	lblCount, rowCount := int64(len(labelRows)), int64(len(valueRows))
+	if lblCount == 0 && rowCount == 0 {
+		return
+	}
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if c.DB == nil || c.DB.IsClosed() {
+			if err = c.reconnect(); err != nil {
+				level.Error(c.logger).Log("msg", "reconnect failed", "attempt", attempt, "err", err)
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+		}
+		if len(labelRows) > 0 {
+			var n int64
+			n, err = c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_labels"}, []string{"metric_id", "metric_name", "metric_name_label", "metric_labels"}, pgx.CopyFromRows(labelRows))
+			if err != nil {
+				level.Error(c.logger).Log("msg", "COPY failed for metric_labels", "attempt", attempt, "err", err)
+				if c.DB.IsClosed() {
+					continue
+				}
+				// Not a connection problem: the values below would point at ids
+				// without a label row. Keep both and retry later.
+				break
+			}
+			if n == lblCount {
+				labelRows = nil
+			}
+		}
+		if err = c.ensurePartitions(valueRows); err != nil {
+			level.Error(c.logger).Log("msg", "creating partitions failed", "attempt", attempt, "err", err)
+			if c.DB.IsClosed() {
+				continue
+			}
+			break
+		}
+		var n int64
+		n, err = c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_values"}, []string{"metric_id", "metric_time", "metric_value"}, pgx.CopyFromRows(valueRows))
 		if err != nil {
-			level.Error(c.logger).Log("msg", "COPY failed for metric_labels", "err", err)
+			level.Error(c.logger).Log("msg", "COPY failed for metric_values", "attempt", attempt, "err", err)
+			if c.DB.IsClosed() {
+				continue
+			}
+			break
 		}
-		if copyCount != lblCount {
-			level.Error(c.logger).Log("msg", "All rows not copied metric_labels", "err", err)
+		if n != rowCount {
+			level.Error(c.logger).Log("msg", "All rows not copied metric_values", "copied", n, "want", rowCount)
 		}
+		valueRows = nil
+		break
 	}
-	copyCount, err = c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_values"}, []string{"metric_id", "metric_time", "metric_value"}, pgx.CopyFromRows(c.valueRows))
-	rowCount = int64(len(c.valueRows))
-	c.valueRows = nil
-	c.PGWriterMutex.Unlock()
-	if err != nil {
-		level.Error(c.logger).Log("msg", "COPY failed for metric_values", "err", err)
-	}
-	if copyCount != rowCount {
-		level.Error(c.logger).Log("msg", "All rows not copied metric_values", "err", err)
+	if len(labelRows) > 0 || len(valueRows) > 0 {
+		vMetricIDMapMutex.Lock()
+		c.labelRows = append(labelRows, c.labelRows...)
+		c.valueRows = append(valueRows, c.valueRows...)
+		if len(c.valueRows) > maxBufferedRows {
+			drop := len(c.valueRows) - maxBufferedRows
+			c.valueRows = c.valueRows[drop:]
+			level.Error(c.logger).Log("msg", "buffer full, dropped oldest samples", "dropped", drop)
+		}
+		vMetricIDMapMutex.Unlock()
+		level.Error(c.logger).Log("msg", "batch kept for retry", "labels", len(labelRows), "values", len(valueRows), "err", err)
+		return
 	}
 	duration := time.Since(begin).Seconds()
 	level.Info(c.logger).Log("metric", fmt.Sprintf("BGWriter%d: Processed samples count,%d, duration,%v", c.id, rowCount+lblCount, duration))
+}
+
+// pending returns the queued value and label rows under the parsers' mutex.
+func (c *PGWriter) pending() (values, labels int) {
+	vMetricIDMapMutex.Lock()
+	defer vMetricIDMapMutex.Unlock()
+	return len(c.valueRows), len(c.labelRows)
+}
+
+// reconnect replaces a broken connection with a new one to DATABASE_URL.
+func (c *PGWriter) reconnect() error {
+	if c.DB != nil {
+		_ = c.DB.Close(context.Background())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		c.DB = nil
+		return err
+	}
+	c.DB = db
+	level.Info(c.logger).Log("msg", "reconnected to PostgreSQL", "host", db.Config().Host)
+	return nil
 }
 
 // Push - Push element at then end of list
@@ -289,8 +396,11 @@ func (c *PGWriter) setupPgPrometheus() error {
 			return err
 		}
 		vMetricIDMap[metricNameLabel] = metricID
+		if metricID > vMetricMaxID {
+			vMetricMaxID = metricID
+		}
 	}
-	level.Info(c.logger).Log("msg", fmt.Sprintf("%d Rows Loaded in map: ", len(vMetricIDMap)))
+	level.Info(c.logger).Log("msg", fmt.Sprintf("%d Rows Loaded in map: ", len(vMetricIDMap)), "max_metric_id", vMetricMaxID)
 	rows.Close()
 
 	return nil
