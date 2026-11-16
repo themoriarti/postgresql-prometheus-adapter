@@ -4,7 +4,9 @@ import (
 	"container/list"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -155,7 +157,7 @@ func (c *PGWriter) RunPGWriter(l log.Logger, tid int, commitSecs int, commitRows
 	period := commitSecs * 1000
 	var err error
 	var parser [20]PGParser
-	c.DB, err = pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	c.DB, err = connect(context.Background())
 	if err != nil {
 		level.Error(c.logger).Log("err", err)
 		os.Exit(1)
@@ -288,7 +290,7 @@ func (c *PGWriter) reconnect() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	db, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+	db, err := connect(ctx)
 	if err != nil {
 		c.DB = nil
 		return err
@@ -296,6 +298,21 @@ func (c *PGWriter) reconnect() error {
 	c.DB = db
 	level.Info(c.logger).Log("msg", "reconnected to PostgreSQL", "host", db.Config().Host)
 	return nil
+}
+
+// connect opens DATABASE_URL. Its errors never carry the password: pgconn
+// redacts the URL it quotes, but a URL that net/url cannot parse comes back
+// wrapped in a *url.Error that quotes it in full, so that error is replaced.
+func connect(ctx context.Context) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig(os.Getenv("DATABASE_URL"))
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return nil, errors.New("cannot parse DATABASE_URL as a URL (value not logged)")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return pgx.ConnectConfig(ctx, cfg)
 }
 
 // Push - Push element at then end of list
@@ -329,9 +346,9 @@ func NewClient(logger log.Logger, cfg *Config) *Client {
 		logger = log.NewNopLogger()
 	}
 
-	conn1, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	conn1, err := connect(context.Background())
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error: Unable to connect to database using DATABASE_URL=", os.Getenv("DATABASE_URL"))
+		level.Error(logger).Log("msg", "unable to connect to database", "err", err)
 		os.Exit(1)
 	}
 
